@@ -1,24 +1,4 @@
-"""Simple, minimal implementation of Mamba in one file of PyTorch.
 
-Suggest reading the following before/while reading the code:
-    [1] Mamba: Linear-Time Sequence Modeling with Selective State Spaces (Albert Gu and Tri Dao)
-        https://arxiv.org/abs/2312.00752
-    [2] The Annotated S4 (Sasha Rush and Sidd Karamcheti)
-        https://srush.github.io/annotated-s4
-
-Glossary:
-    b: batch size                       (`B` in Mamba paper [1] Algorithm 2)
-    l: sequence length                  (`L` in [1] Algorithm 2)
-    d or d_model: hidden dim
-    n or d_state: latent state dim      (`N` in [1] Algorithm 2)
-    expand: expansion factor            (`E` in [1] Section 3.4)
-    d_in or d_inner: d * expand         (`D` in [1] Algorithm 2)
-    A, B, C, D: state space parameters  (See any state space representation formula)
-                                        (B, C are input-dependent (aka selective, a key innovation in Mamba); A, D are not)
-    Δ or delta: input-dependent step size
-    dt_rank: rank of Δ                  (See [1] Section 3.6 "Parameterization of ∆")
-
-"""
 from __future__ import annotations
 import math
 import json
@@ -32,7 +12,7 @@ import scipy.signal as signal
 from scipy.signal import find_peaks
 from astropy.timeseries import LombScargle
 from sklearn.ensemble import RandomForestRegressor
-from wtconv.wtconv2d import WTConv1d
+from wtconv.wtconv1d import WTConv1d
 
 @dataclass
 class ModelArgs:
@@ -114,27 +94,19 @@ class Mamba(nn.Module):
 
 
     def forward(self, input_ids):
-        """
-        Args:
-            input_ids (long tensor): shape (b, l)    (See Glossary at top for definitions of b, l, d_in, n...)
 
-        Returns:
-            logits: shape (b, l, vocab_size)
-
-        Official Implementation:
-            class MambaLMHeadModel, https://github.com/state-spaces/mamba/blob/main/mamba_ssm/models/mixer_seq_simple.py#L173
-
-        """
 
         def calculate_hrv_metrics_and_append(ppg_signals, sampling_rate=30):
-            def detect_peaks(ppg_signal, threshold=0):#0.2  0.5 0
+            def detect_peaks(ppg_signal):  # 0.2  0.5 0
                 if isinstance(ppg_signal, torch.Tensor):
-                    ppg_signal = ppg_signal.cpu().numpy()  # 移动到 CPU 并转换为 NumPy 数组
+                    ppg_signal = ppg_signal.cpu().numpy()  #1
                 diff_signal = np.diff(ppg_signal)
+                mean = np.mean(ppg_signal)
                 peaks = []
                 for i in range(1, len(diff_signal) - 1):
-                    if diff_signal[i - 1] > 0 and diff_signal[i + 1] < 0 and ppg_signal[i] > threshold:
-                        peaks.append(i)
+                    if diff_signal[i - 1] > 0 and diff_signal[i + 1] < 0 and ppg_signal[i] > mean:
+                        if len(peaks) == 0 or (i - peaks[-1]) > 0.2 * sampling_rate:
+                            peaks.append(i)
                 return np.array(peaks)
 
 
@@ -222,21 +194,7 @@ class Mamba(nn.Module):
 
     @staticmethod
     def from_pretrained(pretrained_model_name: str):
-        """Load pretrained weights from HuggingFace into model.
 
-        Args:
-            pretrained_model_name: One of
-                * 'state-spaces/mamba-2.8b-slimpj'
-                * 'state-spaces/mamba-2.8b'
-                * 'state-spaces/mamba-1.4b'
-                * 'state-spaces/mamba-790m'
-                * 'state-spaces/mamba-370m'
-                * 'state-spaces/mamba-130m'
-
-        Returns:
-            model: Mamba model with weights loaded
-
-        """
         from transformers.utils import WEIGHTS_NAME, CONFIG_NAME
         from transformers.utils.hub import cached_file
 
@@ -283,25 +241,7 @@ class ResidualBlock(nn.Module):
 
 
     def forward(self, x):
-        """
-        Args:
-            x: shape (b, l, d)    (See Glossary at top for definitions of b, l, d_in, n...)
-             x (Tensor): 输入张量，形状为(batch_size, sequence_length, hidden_size)
-        Returns:
-            output: shape (b, l, d)
-            输出张量，形状与输入相同
-        Official Implementation:
-            Block.forward(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba_simple.py#L297
 
-            Note: the official repo chains residual blocks that look like
-                [Add -> Norm -> Mamba] -> [Add -> Norm -> Mamba] -> [Add -> Norm -> Mamba] -> ...
-            where the first Add is a no-op. This is purely for performance reasons as this
-            allows them to fuse the Add->Norm.
-
-            We instead implement our blocks as the more familiar, simpler, and numerically equivalent
-                [Norm -> Mamba -> Add] -> [Norm -> Mamba -> Add] -> [Norm -> Mamba -> Add] -> ....
-
-        """
 
         output = self.mixer(self.norm(x)) + x
 
@@ -310,15 +250,12 @@ class ResidualBlock(nn.Module):
 
 class MambaBlock(nn.Module):
     def __init__(self, args: ModelArgs):
-        """A single Mamba block, as described in Figure 3 in Section 3.4 in the Mamba paper [1]."""
         super().__init__()
         # 保存模型参数
         self.args = args
         # 输入线性变换层
         self.in_proj = nn.Linear(args.d_model, args.d_inner * 2, bias=args.bias)
         self.model = nn.Sequential(
-
-
             WTConv1d(in_channels=args.d_inner, out_channels=args.d_inner, kernel_size=3, wt_levels=3),
             nn.BatchNorm1d(args.d_inner),
             nn.MaxPool1d(4, stride=1, padding=2),
@@ -361,19 +298,7 @@ class MambaBlock(nn.Module):
 
 
     def forward(self, x):
-        """MambaBlock的前向传播函数，与Mamba论文图3 Section 3.4相同.
 
-        Args:
-            x: shape (b, l, d)    (See Glossary at top for definitions of b, l, d_in, n...)
-
-        Returns:
-            output: shape (b, l, d)
-
-        Official Implementation:
-            class Mamba, https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba_simple.py#L119
-            mamba_inner_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L311
-
-        """
 
         (b, l, d) = x.shape
 
@@ -403,20 +328,7 @@ class MambaBlock(nn.Module):
 
 
     def ssm(self, x):
-        """运行状态空间模型，参考Mamba论文 Section 3.2和注释[2]:
-            - Algorithm 2 in Section 3.2 in the Mamba paper [1]
-            - run_SSM(A, B, C, u) in The Annotated S4 [2]
 
-        Args:
-            x: shape (b, l, d_in)    (See Glossary at top for definitions of b, l, d_in, n...)
-
-        Returns:
-            output: shape (b, l, d_in)
-
-        Official Implementation:
-            mamba_inner_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L311
-
-        """
 
         (d_in, n) = self.A_log.shape
 
@@ -438,55 +350,17 @@ class MambaBlock(nn.Module):
 
 
     def selective_scan(self, u, delta, A, B, C, D):
-        """执行选择性扫描算法，参考Mamba论文[1] Section 2和注释[2]. See:
-            - Section 2 State Space Models in the Mamba paper [1]
-            - Algorithm 2 in Section 3.2 in the Mamba paper [1]
-            - run_SSM(A, B, C, u) in The Annotated S4 [2]
 
-        经典的离散状态空间公式:
-            x(t + 1) = Ax(t) + Bu(t)
-            y(t)     = Cx(t) + Du(t)
-       除了B和C (以及step size delta用于离散化) 与输入x(t)相关.
-
-        参数:
-            u: shape (b, l, d_in)
-            delta: shape (b, l, d_in)
-            A: shape (d_in, n)
-            B: shape (b, l, n)
-            C: shape (b, l, n)
-            D: shape (d_in,)
-
-        过程概述：
-
-        Returns:
-            output: shape (b, l, d_in)
-
-        Official Implementation:
-            selective_scan_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L86
-            Note: I refactored some parts out of `selective_scan_ref` out, so the functionality doesn't match exactly.
-
-        """
         # 获取输入u的维度
         (b, l, d_in) = u.shape
         # 获取矩阵A的列数
         n = A.shape[1]  #  A: shape (d_in, n)
 
-        # 离散化连续参数(A, B)
-        # - A 使用 zero-order hold (ZOH) 离散化 (see Section 2 Equation 4 in the Mamba paper [1])
-        # - B is 使用一个简化的Euler discretization而不是ZOH.根据作者的讨论:
-        #   "A is the more important term and the performance doesn't change much with the simplification on B"
-
-        # 计算离散化的A
-        # 将delta和A进行点乘，将A沿着delta的最后一个维度进行广播，然后执行逐元素乘法
-        # A:(d_in, n),delta:(b, l, d_in)
-        # A广播拓展->(b,l,d_in, n)，deltaA对应原论文中的A_bar
         deltaA = torch.exp(einsum(delta, A, 'b l d_in, d_in n -> b l d_in n'))
         # delta、B和u,这个计算和原始论文不同
         deltaB_u = einsum(delta, B, u, 'b l d_in, b l n, b l d_in -> b l d_in n')
 
-        # Perform selective scan (see scan_SSM() in The Annotated S4 [2])
-        # Note that the below is sequential, while the official implementation does a much faster parallel scan that
-        # is additionally hardware-aware (like FlashAttention).
+
         # 执行选择性扫描,初始化状态x为零
         x = torch.zeros((b, d_in, n), device=deltaA.device)
         # 初始化输出列表ys
@@ -510,31 +384,17 @@ class MambaBlock(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    """
-    初始化RMSNorm模块，该模块实现了基于均方根的归一化操作。
 
-    参数:
-    d_model (int): 模型的特征维度。
-    eps (float, 可选): 为了避免除以零，添加到分母中的一个小的常数。
-    """
     def __init__(self,
                  d_model: int,
                  eps: float = 1e-5):
         super().__init__()
-        self.eps = eps# 保存输入的eps值，用于数值稳定性。
-        # 创建一个可训练的权重参数，初始值为全1，维度与输入特征维度d_model相同。
+        self.eps = eps
         self.weight = nn.Parameter(torch.ones(d_model))
 
 
     def forward(self, x):
-        """
-                计算输入x的均方根值，用于后续的归一化操作。
-                x.pow(2) 计算x中每个元素的平方。
-                mean(-1, keepdim=True) 对x的最后一个维度（特征维度）进行平方和求平均，保持维度以便进行广播操作。
-                torch.rsqrt 对求得的平均值取倒数和平方根，得到每个特征的均方根值的逆。
-                + self.eps 添加一个小的常数eps以保持数值稳定性，防止除以零的情况发生。
-                x * ... * self.weight 将输入x与计算得到的归一化因子和可训练的权重相乘，得到最终的归一化输出。
-                """
+
         output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
         return output
